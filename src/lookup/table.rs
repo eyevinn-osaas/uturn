@@ -6,14 +6,24 @@
 //! - Peer tuple (IP:port)
 //! - TURN channel ID
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use crate::coarse_time::{coarse_now_ms, is_expired_secs};
+
+/// Lifetime of a channel binding (RFC 5766 §11): 10 minutes, refreshed by a
+/// ChannelBind for the same channel/peer pair.
+pub const CHANNEL_LIFETIME_MS: u64 = 600_000;
+
+/// Lifetime of a permission (RFC 5766 §9): 5 minutes, refreshed by a
+/// CreatePermission (or ChannelBind, which also installs a permission) for the
+/// same peer IP.
+pub const PERMISSION_LIFETIME_MS: u64 = 300_000;
 
 /// Unique allocation identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,19 +50,15 @@ pub struct Allocation {
     /// Client's address (TURN control connection)
     pub client_addr: SocketAddr,
 
-    /// Local ICE username fragment
-    pub local_ufrag: String,
+    /// Permitted peer IP addresses -> expiry (coarse ms). RFC 5766 §9.
+    pub permissions: RwLock<HashMap<IpAddr, u64>>,
 
-    /// Remote ICE username fragment (learned from binding requests)
-    pub remote_ufrag: Option<String>,
+    /// Channel bindings: channel_id -> binding (peer address + expiry)
+    pub channels: DashMap<u16, ChannelBinding>,
 
-    /// Permitted peer IP addresses
-    pub permissions: RwLock<HashSet<IpAddr>>,
-
-    /// Channel bindings: channel_id -> peer_addr
-    pub channels: DashMap<u16, SocketAddr>,
-
-    /// Reverse channel lookup: peer_addr -> channel_id
+    /// Reverse channel lookup: peer_addr -> channel_id. Liveness is decided by
+    /// the forward entry in `channels`; this map may briefly hold a lapsed
+    /// channel number until `cleanup_expired_channels` reaps it.
     pub channels_reverse: DashMap<SocketAddr, u16>,
 
     /// Known peer addresses (learned from traffic)
@@ -81,16 +87,42 @@ pub struct Allocation {
     /// Username for authentication
     pub username: String,
 
-    /// Remote ufrag this allocation wants to communicate with (from ICE)
-    /// Set when we see a STUN Binding Request with USERNAME attribute
-    pub paired_ufrag: RwLock<Option<String>>,
+    /// Transaction id of the Allocate request that created this allocation.
+    /// Used to tell a retransmitted Allocate (same id: resend success) from a
+    /// new Allocate over an existing 5-tuple (437 Allocation Mismatch).
+    pub allocate_txn_id: [u8; 12],
 
-    /// This allocation's ICE ufrag (learned from STUN USERNAME attribute)
-    /// Different from local_ufrag which is server-generated
-    pub ice_ufrag: RwLock<Option<String>>,
+    /// This allocation's ICE ufrag (learned from STUN USERNAME attribute).
+    /// Stored as Arc<str> so hot-path reads are a cheap refcount bump.
+    pub ice_ufrag: RwLock<Option<Arc<str>>>,
 
     /// Remote ICE ufrag this allocation communicates with (from STUN USERNAME)
-    pub ice_remote_ufrag: RwLock<Option<String>>,
+    pub ice_remote_ufrag: RwLock<Option<Arc<str>>>,
+}
+
+/// A channel binding: the bound peer plus the deadline at which it lapses.
+///
+/// RFC 5766 §11 gives channel bindings a 10-minute lifetime, refreshed by a
+/// ChannelBind for the same pair. Without expiry the §11.2 conflict rules
+/// ("channel not bound to a different peer, peer not bound to a different
+/// channel") would hold for the whole life of the allocation, and a client
+/// that legitimately rebinds a peer to a new channel number - libwebrtc does
+/// exactly this when a `TurnEntry` is torn down and recreated for the same
+/// address after an ICE restart, having advanced its channel counter - would
+/// get a permanent 400 for the rest of the call.
+#[derive(Debug)]
+pub struct ChannelBinding {
+    /// Peer this channel is bound to.
+    pub peer_addr: SocketAddr,
+    /// Coarse-clock deadline; the binding is lapsed once `now >= expires_ms`.
+    pub expires_ms: AtomicU64,
+}
+
+impl ChannelBinding {
+    #[inline]
+    fn is_live(&self, now_ms: u64) -> bool {
+        now_ms < self.expires_ms.load(Ordering::Relaxed)
+    }
 }
 
 /// Information about a known peer
@@ -102,15 +134,18 @@ pub struct PeerInfo {
 
 impl Allocation {
     /// Create a new allocation
-    pub fn new(client_addr: SocketAddr, username: String, lifetime_secs: u32) -> Self {
+    pub fn new(
+        client_addr: SocketAddr,
+        username: String,
+        lifetime_secs: u32,
+        allocate_txn_id: [u8; 12],
+    ) -> Self {
         let now_ms = coarse_now_ms();
         let expires_ms = now_ms + (lifetime_secs as u64 * 1000);
         Self {
             id: AllocationId::new(),
             client_addr,
-            local_ufrag: generate_ufrag(),
-            remote_ufrag: None,
-            permissions: RwLock::new(HashSet::new()),
+            permissions: RwLock::new(HashMap::new()),
             channels: DashMap::new(),
             channels_reverse: DashMap::new(),
             known_peers: DashMap::new(),
@@ -121,31 +156,16 @@ impl Allocation {
             last_successful_relay_ms: AtomicU64::new(0),
             has_relay_attempt: std::sync::atomic::AtomicBool::new(false),
             username,
-            paired_ufrag: RwLock::new(None),
+            allocate_txn_id,
             ice_ufrag: RwLock::new(None),
             ice_remote_ufrag: RwLock::new(None),
         }
     }
 
-    /// Set the paired ufrag (from ICE USERNAME)
-    /// Returns true if this is a new pairing
-    pub fn set_paired_ufrag(&self, ufrag: String) -> bool {
-        let mut guard = self.paired_ufrag.write();
-        if guard.as_ref() == Some(&ufrag) {
-            return false;
-        }
-        *guard = Some(ufrag);
-        true
-    }
-
-    /// Get the paired ufrag
-    pub fn get_paired_ufrag(&self) -> Option<String> {
-        self.paired_ufrag.read().clone()
-    }
-
     /// Set this allocation's ICE ufrag (from STUN USERNAME local part)
     /// Returns true if this is a new value
-    pub fn set_ice_ufrag(&self, ufrag: String) -> bool {
+    pub fn set_ice_ufrag(&self, ufrag: impl Into<Arc<str>>) -> bool {
+        let ufrag = ufrag.into();
         let mut guard = self.ice_ufrag.write();
         if guard.as_ref() == Some(&ufrag) {
             return false;
@@ -154,13 +174,14 @@ impl Allocation {
         true
     }
 
-    /// Get this allocation's ICE ufrag
-    pub fn get_ice_ufrag(&self) -> Option<String> {
+    /// Get this allocation's ICE ufrag (cheap Arc clone)
+    pub fn get_ice_ufrag(&self) -> Option<Arc<str>> {
         self.ice_ufrag.read().clone()
     }
 
     /// Set the remote ICE ufrag (peer this allocation communicates with)
-    pub fn set_ice_remote_ufrag(&self, ufrag: String) -> bool {
+    pub fn set_ice_remote_ufrag(&self, ufrag: impl Into<Arc<str>>) -> bool {
+        let ufrag = ufrag.into();
         let mut guard = self.ice_remote_ufrag.write();
         if guard.as_ref() == Some(&ufrag) {
             return false;
@@ -169,39 +190,149 @@ impl Allocation {
         true
     }
 
-    /// Get the remote ICE ufrag
-    pub fn get_ice_remote_ufrag(&self) -> Option<String> {
+    /// Get the remote ICE ufrag (cheap Arc clone)
+    pub fn get_ice_remote_ufrag(&self) -> Option<Arc<str>> {
         self.ice_remote_ufrag.read().clone()
     }
 
-    /// Check if a peer IP is permitted
+    /// Check if a peer IP has a *live* permission (RFC 5766 §9)
     #[inline]
     pub fn is_permitted(&self, peer_ip: IpAddr) -> bool {
-        self.permissions.read().contains(&peer_ip)
+        let now = coarse_now_ms();
+        match self.permissions.read().get(&peer_ip) {
+            Some(&expires_ms) => now < expires_ms,
+            None => false,
+        }
     }
 
-    /// Add a permission for a peer IP
+    /// Add or refresh a permission for a peer IP (5-minute lifetime)
     #[inline]
     pub fn add_permission(&self, peer_ip: IpAddr) {
-        self.permissions.write().insert(peer_ip);
+        let expires = coarse_now_ms() + PERMISSION_LIFETIME_MS;
+        self.permissions.write().insert(peer_ip, expires);
     }
 
-    /// Bind a channel to a peer address
+    /// Number of *live* permission entries currently held.
+    #[inline]
+    pub fn permissions_count(&self) -> usize {
+        let now = coarse_now_ms();
+        self.permissions
+            .read()
+            .values()
+            .filter(|&&expires| now < expires)
+            .count()
+    }
+
+    /// Drop permissions whose 5-minute lifetime has elapsed.
+    /// Returns the peer IPs that were removed (for reverse-index cleanup).
+    pub fn cleanup_expired_permissions(&self) -> Vec<IpAddr> {
+        let now = coarse_now_ms();
+        let mut perms = self.permissions.write();
+        let expired: Vec<IpAddr> = perms
+            .iter()
+            .filter(|(_, &expires)| now >= expires)
+            .map(|(&ip, _)| ip)
+            .collect();
+        for ip in &expired {
+            perms.remove(ip);
+        }
+        expired
+    }
+
+    /// Bind a channel to a peer address, or refresh an existing binding.
+    ///
+    /// Keeps `channels` and `channels_reverse` consistent: if the channel was
+    /// previously bound to another peer, or the peer to another channel, the
+    /// stale entries are removed. Otherwise traffic from the old peer would
+    /// still be framed with a channel number the client now associates with
+    /// the new peer. (The handler rejects conflicting binds with 400 per RFC
+    /// 5766 §11.2 while the old binding is live; this also covers the rebind
+    /// that becomes legal once it has lapsed.)
     pub fn bind_channel(&self, channel: u16, peer_addr: SocketAddr) {
-        self.channels.insert(channel, peer_addr);
-        self.channels_reverse.insert(peer_addr, channel);
+        let expires_ms = coarse_now_ms() + CHANNEL_LIFETIME_MS;
+
+        match self.channels.entry(channel) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                let old_peer = e.get().peer_addr;
+                if old_peer == peer_addr {
+                    // Refresh in place.
+                    e.get().expires_ms.store(expires_ms, Ordering::Relaxed);
+                } else {
+                    e.replace_entry(ChannelBinding {
+                        peer_addr,
+                        expires_ms: AtomicU64::new(expires_ms),
+                    });
+                    self.channels_reverse.remove(&old_peer);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert(ChannelBinding {
+                    peer_addr,
+                    expires_ms: AtomicU64::new(expires_ms),
+                });
+            }
+        }
+
+        if let Some(old_channel) = self.channels_reverse.insert(peer_addr, channel) {
+            if old_channel != channel {
+                self.channels.remove(&old_channel);
+            }
+        }
     }
 
-    /// Get channel for a peer address
+    /// Number of channels currently bound and not yet lapsed.
+    #[inline]
+    pub fn channels_count(&self) -> usize {
+        let now_ms = coarse_now_ms();
+        self.channels
+            .iter()
+            .filter(|e| e.value().is_live(now_ms))
+            .count()
+    }
+
+    /// Get the live channel bound to a peer address.
+    ///
+    /// The forward entry is authoritative: `channels_reverse` can outlive it
+    /// between cleanup passes.
     #[inline]
     pub fn channel_for_peer(&self, peer_addr: SocketAddr) -> Option<u16> {
-        self.channels_reverse.get(&peer_addr).map(|r| *r)
+        let channel = *self.channels_reverse.get(&peer_addr)?;
+        let binding = self.channels.get(&channel)?;
+        if binding.peer_addr == peer_addr && binding.is_live(coarse_now_ms()) {
+            Some(channel)
+        } else {
+            None
+        }
     }
 
-    /// Get peer address for a channel
+    /// Get the peer address bound to a channel, if the binding is still live.
     #[inline]
     pub fn peer_for_channel(&self, channel: u16) -> Option<SocketAddr> {
-        self.channels.get(&channel).map(|r| *r)
+        let binding = self.channels.get(&channel)?;
+        if binding.is_live(coarse_now_ms()) {
+            Some(binding.peer_addr)
+        } else {
+            None
+        }
+    }
+
+    /// Drop channel bindings whose 10-minute lifetime has elapsed, freeing the
+    /// channel number and the peer for a fresh bind.
+    pub fn cleanup_expired_channels(&self) {
+        let now_ms = coarse_now_ms();
+        let mut lapsed: Vec<(u16, SocketAddr)> = Vec::new();
+        for entry in self.channels.iter() {
+            if !entry.value().is_live(now_ms) {
+                lapsed.push((*entry.key(), entry.value().peer_addr));
+            }
+        }
+        for (channel, peer_addr) in lapsed {
+            self.channels.remove(&channel);
+            // Only clear the reverse entry if it still points at this channel;
+            // a concurrent rebind may already have claimed the peer.
+            self.channels_reverse
+                .remove_if(&peer_addr, |_, &ch| ch == channel);
+        }
     }
 
     /// Update last activity time (lock-free, uses coarse timestamp)
@@ -284,30 +415,22 @@ impl Allocation {
     }
 }
 
-/// ICE ufrag pair for bidirectional matching
-/// Format: (local_ufrag, remote_ufrag)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct IceUfragPair {
-    local: String,
-    remote: String,
-}
-
-impl IceUfragPair {
-    fn new(local: String, remote: String) -> Self {
-        Self { local, remote }
-    }
-}
-
 /// Multi-index lookup table for allocations
+///
+/// LOCK ORDER (must hold globally to avoid ABBA deadlocks):
+/// `allocations` is the primary map; every other field is a secondary index.
+/// Any code that needs guards on both the primary map and a secondary index
+/// MUST acquire the `allocations` guard FIRST. The `cleanup_*` paths rely on
+/// this: they hold an `allocations` shard write lock (via `retain`) and then
+/// mutate the secondary indices. A path that locked a secondary index first
+/// and then `allocations` would deadlock against a concurrent cleanup on the
+/// multi-thread runtime.
 pub struct AllocationTable {
     /// All allocations by ID
     allocations: DashMap<AllocationId, Allocation>,
 
     /// Lookup by client address (primary key)
     by_client: DashMap<SocketAddr, AllocationId>,
-
-    /// Lookup by local ufrag
-    by_ufrag: DashMap<String, AllocationId>,
 
     /// Lookup by permitted peer IP -> list of allocations
     /// (multiple clients may permit the same peer)
@@ -317,12 +440,7 @@ pub struct AllocationTable {
     by_peer_tuple: DashMap<SocketAddr, AllocationId>,
 
     /// Lookup by ICE ufrag (learned from STUN USERNAME attribute)
-    /// This is the client's actual ICE ufrag, not server-generated
     by_ice_ufrag: DashMap<String, AllocationId>,
-
-    /// Lookup by ICE ufrag pair for O(1) bidirectional matching
-    /// Key: (local_ufrag, remote_ufrag) -> allocation that wants to receive from that pair
-    by_ice_ufrag_pair: DashMap<IceUfragPair, AllocationId>,
 }
 
 impl AllocationTable {
@@ -331,11 +449,9 @@ impl AllocationTable {
         Self {
             allocations: DashMap::new(),
             by_client: DashMap::new(),
-            by_ufrag: DashMap::new(),
             by_permission: DashMap::new(),
             by_peer_tuple: DashMap::new(),
             by_ice_ufrag: DashMap::new(),
-            by_ice_ufrag_pair: DashMap::new(),
         }
     }
 
@@ -350,26 +466,38 @@ impl AllocationTable {
         client_addr: SocketAddr,
         username: String,
         lifetime_secs: u32,
+        allocate_txn_id: [u8; 12],
     ) -> (AllocationId, bool) {
         use dashmap::mapref::entry::Entry;
 
-        // Use entry API for atomic check-and-insert
-        match self.by_client.entry(client_addr) {
-            Entry::Occupied(entry) => {
-                // Allocation already exists for this client
-                (*entry.get(), false)
-            }
+        // Fast path: an allocation already exists. The guard is dropped at the
+        // end of this statement, before any other map is touched.
+        if let Some(id) = self.by_client.get(&client_addr).map(|r| *r) {
+            return (id, false);
+        }
+
+        // Lock-order invariant: `allocations` before any secondary index, and
+        // never hold guards on both at once. Insert into the primary map first
+        // (guard released immediately), then claim the by_client slot. If we
+        // lose the race for the slot, roll back our primary insert.
+        let alloc = Allocation::new(client_addr, username, lifetime_secs, allocate_txn_id);
+        let id = alloc.id;
+        self.allocations.insert(id, alloc);
+
+        let claimed = match self.by_client.entry(client_addr) {
+            Entry::Occupied(entry) => Err(*entry.get()),
             Entry::Vacant(entry) => {
-                // No allocation exists - create one atomically
-                let alloc = Allocation::new(client_addr, username, lifetime_secs);
-                let id = alloc.id;
-                let ufrag = alloc.local_ufrag.clone();
-
                 entry.insert(id);
-                self.by_ufrag.insert(ufrag, id);
-                self.allocations.insert(id, alloc);
+                Ok(())
+            }
+        };
 
-                (id, true)
+        match claimed {
+            Ok(()) => (id, true),
+            Err(existing) => {
+                // Concurrent request won the race - discard ours.
+                self.allocations.remove(&id);
+                (existing, false)
             }
         }
     }
@@ -383,7 +511,7 @@ impl AllocationTable {
         username: String,
         lifetime_secs: u32,
     ) -> AllocationId {
-        let (id, _created) = self.create_or_get(client_addr, username, lifetime_secs);
+        let (id, _created) = self.create_or_get(client_addr, username, lifetime_secs, [0u8; 12]);
         id
     }
 
@@ -402,8 +530,12 @@ impl AllocationTable {
         &self,
         addr: SocketAddr,
     ) -> Option<dashmap::mapref::one::Ref<'_, AllocationId, Allocation>> {
-        let id = self.by_client.get(&addr)?;
-        self.allocations.get(&*id)
+        // Copy the id out so the by_client guard is released before we take
+        // an `allocations` guard. Holding both inverts the documented lock
+        // order (cleanup holds `allocations` then removes from `by_client`)
+        // and can deadlock against a concurrent cleanup.
+        let id = *self.by_client.get(&addr)?;
+        self.allocations.get(&id)
     }
 
     /// Check if address is a known client (has an allocation)
@@ -433,78 +565,63 @@ impl AllocationTable {
         self.by_peer_tuple.get(&addr).map(|r| *r)
     }
 
-    /// Lookup by ICE ufrag
-    pub fn lookup_by_ufrag(&self, ufrag: &str) -> Option<AllocationId> {
-        self.by_ufrag.get(ufrag).map(|r| *r)
-    }
-
-    /// Find all allocations that are paired with a given ufrag
-    /// These are allocations that want to receive data from the allocation with that ufrag
-    pub fn find_paired_allocations(&self, ufrag: &str) -> Vec<AllocationId> {
-        let mut result = Vec::new();
-        for entry in self.allocations.iter() {
-            if let Some(paired) = entry.value().get_paired_ufrag() {
-                if paired == ufrag {
-                    result.push(entry.value().id);
-                }
-            }
-        }
-        result
-    }
-
-    /// Set pairing: receiver with ice_ufrag=receiver_ufrag should receive from sender_ufrag
-    /// This is called when we see sender send STUN Binding Request to receiver
-    /// Returns true if the pairing was set, false if receiver not found
-    pub fn set_pairing(&self, sender_ice_ufrag: &str, receiver_ice_ufrag: &str) -> bool {
-        // Find the receiver allocation by ICE ufrag
-        if let Some(receiver_id) = self.lookup_by_ice_ufrag(receiver_ice_ufrag) {
-            if let Some(receiver_alloc) = self.allocations.get(&receiver_id) {
-                receiver_alloc.set_paired_ufrag(sender_ice_ufrag.to_string());
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Register ICE ufrag pair for an allocation (learned from STUN USERNAME)
-    /// local_ufrag is this client's ufrag, remote_ufrag is who they want to talk to
+    /// Register ICE ufrag pair for an allocation (learned from STUN USERNAME).
+    /// `local_ufrag` is this client's ufrag; `remote_ufrag` is who they want to talk to.
     ///
-    /// Uses by_ice_ufrag as atomic check: if local_ufrag already registered to another
-    /// allocation, this is a broadcast duplicate and we skip registration.
+    /// First-come ownership of a given `local_ufrag` is preserved across
+    /// *different* allocations (hijack protection). The *same* allocation may
+    /// update its credentials (ICE restart): old index entries are removed and
+    /// the new pair is installed.
     pub fn register_ice_ufrags(
         &self,
         id: AllocationId,
         local_ufrag: String,
         remote_ufrag: String,
     ) -> bool {
-        // Atomic check: try to insert into by_ice_ufrag index
-        // If already exists for DIFFERENT allocation, this is broadcast duplicate
         use dashmap::mapref::entry::Entry;
+
+        // Lock-order invariant: `allocations` MUST be locked before any secondary
+        // index, never the reverse. Acquire the allocation ref first and hold it
+        // across the by_ice_ufrag claim.
+        let alloc = match self.allocations.get(&id) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        // If this local_ufrag is already claimed, only the owning allocation may
+        // refresh/update its remote side.
+        if let Some(owner) = self.by_ice_ufrag.get(&local_ufrag).map(|r| *r) {
+            if owner != id {
+                return false;
+            }
+            alloc.set_ice_ufrag(local_ufrag);
+            alloc.set_ice_remote_ufrag(remote_ufrag);
+            return true;
+        }
+
+        // New local_ufrag claim. Drop any previous local ufrag this allocation
+        // held (ICE restart with a fresh local credential).
+        if let Some(old_local) = alloc.get_ice_ufrag() {
+            if old_local.as_ref() != local_ufrag.as_str() {
+                self.by_ice_ufrag.remove(old_local.as_ref());
+            }
+        }
+
         match self.by_ice_ufrag.entry(local_ufrag.clone()) {
-            Entry::Occupied(_) => {
-                // Already registered by this or another allocation - skip
-                false
+            Entry::Occupied(entry) => {
+                // Lost a race: another allocation claimed it first.
+                if *entry.get() != id {
+                    return false;
+                }
+                alloc.set_ice_ufrag(local_ufrag);
+                alloc.set_ice_remote_ufrag(remote_ufrag);
+                true
             }
             Entry::Vacant(entry) => {
-                // Not registered yet - this allocation wins
-                if let Some(alloc) = self.allocations.get(&id) {
-                    if alloc.get_ice_ufrag().is_some() {
-                        // Allocation already has different ufrag, don't overwrite
-                        return false;
-                    }
-                    alloc.set_ice_ufrag(local_ufrag.clone());
-                    alloc.set_ice_remote_ufrag(remote_ufrag.clone());
-                    entry.insert(id);
-
-                    // Also register in the pair index for O(1) bidirectional lookup
-                    // Key is (local, remote) so find_ice_peers can lookup by reverse
-                    let pair = IceUfragPair::new(local_ufrag, remote_ufrag);
-                    self.by_ice_ufrag_pair.insert(pair, id);
-
-                    true
-                } else {
-                    false
-                }
+                alloc.set_ice_ufrag(local_ufrag);
+                alloc.set_ice_remote_ufrag(remote_ufrag);
+                entry.insert(id);
+                true
             }
         }
     }
@@ -514,36 +631,26 @@ impl AllocationTable {
         self.by_ice_ufrag.get(ice_ufrag).map(|r| *r)
     }
 
-    /// Find all allocations paired with a given ICE ufrag
-    /// These are allocations that want to receive from sender with that ice_ufrag
-    pub fn find_paired_by_ice_ufrag(&self, ice_ufrag: &str) -> Vec<AllocationId> {
-        let mut result = Vec::new();
-        for entry in self.allocations.iter() {
-            if let Some(paired) = entry.value().get_paired_ufrag() {
-                if paired == ice_ufrag {
-                    result.push(entry.value().id);
-                }
-            }
+    /// Find allocations that are ICE peers of the sender.
+    /// Bi-directional: sender (local=X, remote=Y) matches peer (local=Y, remote=X).
+    ///
+    /// Avoids allocating Strings: look up the peer by its local ufrag (our
+    /// remote) via `by_ice_ufrag`, then verify its remote matches our local.
+    pub fn find_ice_peers(&self, sender_local: &str, sender_remote: &str) -> Vec<AllocationId> {
+        match self.find_ice_peer(sender_local, sender_remote) {
+            Some(id) => vec![id],
+            None => Vec::new(),
         }
-        result
     }
 
-    /// Find allocations that are ICE peers of the sender
-    /// Uses bi-directional matching: if sender has (local=X, remote=Y),
-    /// find allocations with (local=Y, remote=X)
-    ///
-    /// This is now O(1) using the by_ice_ufrag_pair index instead of O(n) iteration.
-    pub fn find_ice_peers(&self, sender_local: &str, sender_remote: &str) -> Vec<AllocationId> {
-        // We want to find allocations where:
-        // - their local_ufrag == sender's remote_ufrag
-        // - their remote_ufrag == sender's local_ufrag
-        // So we look up the "reverse" pair
-        let reverse_pair = IceUfragPair::new(sender_remote.to_string(), sender_local.to_string());
-
-        if let Some(id) = self.by_ice_ufrag_pair.get(&reverse_pair) {
-            vec![*id]
-        } else {
-            Vec::new()
+    /// Single-peer variant of [`find_ice_peers`] — hot path prefers this.
+    pub fn find_ice_peer(&self, sender_local: &str, sender_remote: &str) -> Option<AllocationId> {
+        let id = *self.by_ice_ufrag.get(sender_remote)?;
+        let alloc = self.allocations.get(&id)?;
+        let remote = alloc.ice_remote_ufrag.read();
+        match remote.as_deref() {
+            Some(r) if r == sender_local => Some(id),
+            _ => None,
         }
     }
 
@@ -579,17 +686,86 @@ impl AllocationTable {
         (candidates, is_unique)
     }
 
-    /// Add permission and update index
+    /// Remove `id` from `by_permission` for `peer_ip`, dropping the map entry
+    /// when the Vec becomes empty so the DashMap does not accumulate empties.
+    fn remove_from_permission_index(&self, peer_ip: IpAddr, id: AllocationId) {
+        let empty = if let Some(mut ids) = self.by_permission.get_mut(&peer_ip) {
+            ids.retain(|&i| i != id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            // Re-check emptiness under the entry API to avoid removing a Vec
+            // that another thread just re-populated.
+            self.by_permission.remove_if(&peer_ip, |_, v| v.is_empty());
+        }
+    }
+
+    /// Add permission and update index (also refreshes lifetime).
     pub fn add_permission(&self, id: AllocationId, peer_ip: IpAddr) {
         if let Some(alloc) = self.allocations.get(&id) {
             alloc.add_permission(peer_ip);
         }
 
-        // Only add if not already in the list (avoid duplicates on permission refresh)
         let mut entry = self.by_permission.entry(peer_ip).or_default();
         if !entry.contains(&id) {
             entry.push(id);
         }
+    }
+
+    /// Atomically check the permission cap, insert *or refresh* peer IPs.
+    ///
+    /// Holds the allocation's permissions write lock across the count check
+    /// and insert, preventing TOCTOU races between concurrent CreatePermission
+    /// requests. Existing permissions are refreshed to a new 5-minute lifetime
+    /// (RFC 5766 §9) even when already present. Returns `false` if the
+    /// allocation does not exist or if adding the new IPs would exceed `cap`;
+    /// in both cases no state is modified.
+    pub fn try_add_permissions_capped(
+        &self,
+        id: AllocationId,
+        peer_ips: &[IpAddr],
+        cap: usize,
+    ) -> bool {
+        let alloc = match self.allocations.get(&id) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        let now = coarse_now_ms();
+        let expires = now + PERMISSION_LIFETIME_MS;
+
+        let to_index: Vec<IpAddr> = {
+            let mut perms = alloc.permissions.write();
+            // Count only live permissions toward the cap.
+            let live: usize = perms.values().filter(|&&e| now < e).count();
+            let new_ips: Vec<IpAddr> = peer_ips
+                .iter()
+                .filter(|ip| match perms.get(ip) {
+                    Some(&e) if now < e => false, // already live
+                    _ => true,
+                })
+                .copied()
+                .collect();
+            if live + new_ips.len() > cap {
+                return false;
+            }
+            // Refresh every requested IP (new or existing).
+            for ip in peer_ips {
+                perms.insert(*ip, expires);
+            }
+            peer_ips.to_vec()
+        };
+
+        for ip in to_index {
+            let mut entry = self.by_permission.entry(ip).or_default();
+            if !entry.contains(&id) {
+                entry.push(id);
+            }
+        }
+
+        true
     }
 
     /// Register peer tuple for fast path lookup
@@ -608,31 +784,50 @@ impl AllocationTable {
         }
     }
 
-    /// Remove an allocation
-    pub fn remove(&self, id: AllocationId) {
+    /// Remove an allocation.
+    ///
+    /// Returns `true` if the allocation existed and was removed by this call,
+    /// `false` if it was already gone (e.g. reaped concurrently by cleanup).
+    /// Callers that account for the removal elsewhere (rate limiter quota)
+    /// must only do so when this returns `true`.
+    pub fn remove(&self, id: AllocationId) -> bool {
         if let Some((_, alloc)) = self.allocations.remove(&id) {
             self.by_client.remove(&alloc.client_addr);
-            self.by_ufrag.remove(&alloc.local_ufrag);
-
-            // Remove from ICE ufrag indices
-            if let (Some(ice_ufrag), Some(ice_remote)) =
-                (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
-            {
-                self.by_ice_ufrag.remove(&ice_ufrag);
-                let pair = IceUfragPair::new(ice_ufrag, ice_remote);
-                self.by_ice_ufrag_pair.remove(&pair);
-            } else if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
-                self.by_ice_ufrag.remove(&ice_ufrag);
+            if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                self.by_ice_ufrag.remove(ice_ufrag.as_ref());
             }
 
-            for peer_ip in alloc.permissions.read().iter() {
-                if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
-                    ids.retain(|&i| i != id);
-                }
+            for &peer_ip in alloc.permissions.read().keys() {
+                self.remove_from_permission_index(peer_ip, id);
             }
 
             for entry in alloc.known_peers.iter() {
                 self.by_peer_tuple.remove(entry.key());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop lapsed channel bindings across every allocation (RFC 5766 §11).
+    ///
+    /// Touches only each allocation's own channel maps, never a secondary
+    /// index, so it does not participate in the `allocations`-before-index
+    /// lock order documented above.
+    pub fn cleanup_channel_bindings(&self) {
+        for entry in self.allocations.iter() {
+            entry.value().cleanup_expired_channels();
+        }
+    }
+
+    /// Drop lapsed permissions (RFC 5766 §9) and prune empty `by_permission` entries.
+    pub fn cleanup_permissions(&self) {
+        for entry in self.allocations.iter() {
+            let id = *entry.key();
+            let expired = entry.value().cleanup_expired_permissions();
+            for peer_ip in expired {
+                self.remove_from_permission_index(peer_ip, id);
             }
         }
     }
@@ -651,21 +846,11 @@ impl AllocationTable {
                 // Clean up indices before removal
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
-                self.by_ufrag.remove(&alloc.local_ufrag);
-                // Clean up ICE ufrag indices
-                if let (Some(ice_ufrag), Some(ice_remote)) =
-                    (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
-                {
-                    self.by_ice_ufrag.remove(&ice_ufrag);
-                    let pair = IceUfragPair::new(ice_ufrag, ice_remote);
-                    self.by_ice_ufrag_pair.remove(&pair);
-                } else if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
-                    self.by_ice_ufrag.remove(&ice_ufrag);
+                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                    self.by_ice_ufrag.remove(ice_ufrag.as_ref());
                 }
-                for peer_ip in alloc.permissions.read().iter() {
-                    if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
-                        ids.retain(|&i| i != *id);
-                    }
+                for &peer_ip in alloc.permissions.read().keys() {
+                    self.remove_from_permission_index(peer_ip, *id);
                 }
                 for entry in alloc.known_peers.iter() {
                     self.by_peer_tuple.remove(entry.key());
@@ -694,21 +879,11 @@ impl AllocationTable {
                 // Clean up indices
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
-                self.by_ufrag.remove(&alloc.local_ufrag);
-                // Clean up ICE ufrag indices
-                if let (Some(ice_ufrag), Some(ice_remote)) =
-                    (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
-                {
-                    self.by_ice_ufrag.remove(&ice_ufrag);
-                    let pair = IceUfragPair::new(ice_ufrag, ice_remote);
-                    self.by_ice_ufrag_pair.remove(&pair);
-                } else if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
-                    self.by_ice_ufrag.remove(&ice_ufrag);
+                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                    self.by_ice_ufrag.remove(ice_ufrag.as_ref());
                 }
-                for peer_ip in alloc.permissions.read().iter() {
-                    if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
-                        ids.retain(|&i| i != *id);
-                    }
+                for &peer_ip in alloc.permissions.read().keys() {
+                    self.remove_from_permission_index(peer_ip, *id);
                 }
                 for entry in alloc.known_peers.iter() {
                     self.by_peer_tuple.remove(entry.key());
@@ -737,21 +912,11 @@ impl AllocationTable {
                 // Clean up indices
                 removed_ips.push(alloc.client_addr.ip());
                 self.by_client.remove(&alloc.client_addr);
-                self.by_ufrag.remove(&alloc.local_ufrag);
-                // Clean up ICE ufrag indices
-                if let (Some(ice_ufrag), Some(ice_remote)) =
-                    (alloc.get_ice_ufrag(), alloc.get_ice_remote_ufrag())
-                {
-                    self.by_ice_ufrag.remove(&ice_ufrag);
-                    let pair = IceUfragPair::new(ice_ufrag, ice_remote);
-                    self.by_ice_ufrag_pair.remove(&pair);
-                } else if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
-                    self.by_ice_ufrag.remove(&ice_ufrag);
+                if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
+                    self.by_ice_ufrag.remove(ice_ufrag.as_ref());
                 }
-                for peer_ip in alloc.permissions.read().iter() {
-                    if let Some(mut ids) = self.by_permission.get_mut(peer_ip) {
-                        ids.retain(|&i| i != *id);
-                    }
+                for &peer_ip in alloc.permissions.read().keys() {
+                    self.remove_from_permission_index(peer_ip, *id);
                 }
                 for entry in alloc.known_peers.iter() {
                     self.by_peer_tuple.remove(entry.key());
@@ -771,26 +936,129 @@ impl Default for AllocationTable {
     }
 }
 
-/// Generate a cryptographically secure ICE username fragment
-fn generate_ufrag() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 12] = rng.gen();
-    // Base64-like encoding using alphanumeric chars (ICE-safe)
-    bytes
-        .iter()
-        .map(|b| {
-            let idx = (b % 62) as usize;
-            const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-            CHARS[idx] as char
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    // ---- channel binding lifetime (RFC 5766 §11) ----------------------------
+
+    /// Force a binding past its deadline without waiting out the real lifetime.
+    fn lapse(alloc: &Allocation, channel: u16) {
+        alloc
+            .channels
+            .get(&channel)
+            .expect("channel bound")
+            .expires_ms
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn lapsed_channel_binding_frees_the_peer_for_a_new_channel() {
+        // RFC 5766 §11.2 forbids rebinding a peer to a different channel only
+        // while the binding is live; §11 caps that at 10 minutes. libwebrtc
+        // rebinds the same peer to a higher channel number after a TurnEntry is
+        // destroyed and recreated (ICE restart), so a conflict that never
+        // lapsed would 400 for the rest of the allocation.
+        let alloc = Allocation::new(
+            "198.51.100.5:50000".parse().unwrap(),
+            "u".to_string(),
+            600,
+            [0u8; 12],
+        );
+        let peer: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+
+        alloc.bind_channel(0x4000, peer);
+        assert_eq!(alloc.channel_for_peer(peer), Some(0x4000));
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer));
+        assert_eq!(alloc.channels_count(), 1);
+
+        lapse(&alloc, 0x4000);
+
+        // The lapsed binding is invisible, so the handler sees no conflict.
+        assert_eq!(alloc.channel_for_peer(peer), None);
+        assert_eq!(alloc.peer_for_channel(0x4000), None);
+        assert_eq!(alloc.channels_count(), 0);
+
+        // ... and the peer may be bound to a fresh channel number.
+        alloc.bind_channel(0x4001, peer);
+        assert_eq!(alloc.channel_for_peer(peer), Some(0x4001));
+        assert_eq!(alloc.peer_for_channel(0x4001), Some(peer));
+        assert_eq!(alloc.channels_count(), 1);
+    }
+
+    #[test]
+    fn rebinding_same_pair_refreshes_the_lifetime() {
+        let alloc = Allocation::new(
+            "198.51.100.5:50000".parse().unwrap(),
+            "u".to_string(),
+            600,
+            [0u8; 12],
+        );
+        let peer: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+
+        alloc.bind_channel(0x4000, peer);
+        lapse(&alloc, 0x4000);
+        assert_eq!(alloc.peer_for_channel(0x4000), None);
+
+        // A ChannelBind for the same pair revives it rather than allocating a
+        // second slot.
+        alloc.bind_channel(0x4000, peer);
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(peer));
+        assert_eq!(alloc.channels_count(), 1);
+    }
+
+    #[test]
+    fn cleanup_expired_channels_reaps_both_maps() {
+        let table = AllocationTable::new();
+        let client: SocketAddr = "198.51.100.5:50000".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+        let peer: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+        let live_peer: SocketAddr = "203.0.113.21:5000".parse().unwrap();
+
+        {
+            let alloc = table.get(id).unwrap();
+            alloc.bind_channel(0x4000, peer);
+            alloc.bind_channel(0x4001, live_peer);
+            lapse(&alloc, 0x4000);
+        }
+
+        table.cleanup_channel_bindings();
+
+        let alloc = table.get(id).unwrap();
+        assert!(alloc.channels.get(&0x4000).is_none());
+        assert!(
+            alloc.channels_reverse.get(&peer).is_none(),
+            "reverse entry must not outlive the binding"
+        );
+        // The still-live binding is untouched.
+        assert_eq!(alloc.peer_for_channel(0x4001), Some(live_peer));
+        assert_eq!(alloc.channel_for_peer(live_peer), Some(0x4001));
+    }
+
+    #[test]
+    fn rebinding_a_channel_to_a_new_peer_clears_the_old_reverse_entry() {
+        let alloc = Allocation::new(
+            "198.51.100.5:50000".parse().unwrap(),
+            "u".to_string(),
+            600,
+            [0u8; 12],
+        );
+        let old: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+        let new: SocketAddr = "203.0.113.21:5000".parse().unwrap();
+
+        alloc.bind_channel(0x4000, old);
+        alloc.bind_channel(0x4000, new);
+
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(new));
+        assert_eq!(alloc.channel_for_peer(new), Some(0x4000));
+        assert_eq!(
+            alloc.channel_for_peer(old),
+            None,
+            "old peer must not keep a channel the client reassigned"
+        );
+        assert_eq!(alloc.channels_count(), 1);
+    }
 
     #[test]
     fn test_create_allocation() {
@@ -815,5 +1083,394 @@ mod tests {
         let found = table.lookup_by_peer_ip(peer_ip);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], id);
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn try_add_permissions_capped_rejects_when_over_cap() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peers = [ip("10.0.0.1"), ip("10.0.0.2"), ip("10.0.0.3")];
+        // Cap of 2 with 3 new IPs -> reject, no state modification.
+        assert!(!table.try_add_permissions_capped(id, &peers, 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 0);
+        for p in &peers {
+            assert!(table.lookup_by_peer_ip(*p).is_empty());
+        }
+    }
+
+    #[test]
+    fn try_add_permissions_capped_allows_refresh_at_cap() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        let peers = [ip("10.0.0.1"), ip("10.0.0.2")];
+        assert!(table.try_add_permissions_capped(id, &peers, 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 2);
+
+        // Refresh the same IPs -- must not count as new additions.
+        assert!(table.try_add_permissions_capped(id, &peers, 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 2);
+    }
+
+    #[test]
+    fn try_add_permissions_capped_mixed_new_and_existing() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        assert!(table.try_add_permissions_capped(id, &[ip("10.0.0.1")], 2));
+        // Existing 10.0.0.1 plus new 10.0.0.2 -> total 2, within cap of 2.
+        assert!(table.try_add_permissions_capped(id, &[ip("10.0.0.1"), ip("10.0.0.2")], 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 2);
+        // Adding a third distinct IP now exceeds cap.
+        assert!(!table.try_add_permissions_capped(id, &[ip("10.0.0.3")], 2));
+        assert_eq!(table.get(id).unwrap().permissions_count(), 2);
+    }
+
+    #[test]
+    fn try_add_permissions_capped_is_atomic_under_concurrent_callers() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let table = Arc::new(AllocationTable::new());
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        const CAP: usize = 64;
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 16;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let table = table.clone();
+                thread::spawn(move || {
+                    let peers: Vec<IpAddr> = (0..PER_THREAD)
+                        .map(|i| ip(&format!("10.{}.{}.1", t, i)))
+                        .collect();
+                    // Each thread tries to add 16 unique IPs. 8*16 = 128 > cap 64,
+                    // so some must fail. The cap must never be exceeded regardless.
+                    let _ = table.try_add_permissions_capped(id, &peers, CAP);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = table.get(id).unwrap().permissions_count();
+        assert!(
+            total <= CAP,
+            "permissions_count {} exceeded cap {}",
+            total,
+            CAP
+        );
+    }
+
+    /// Regression guard for the ABBA deadlock between `get_by_client` /
+    /// `create_or_get` (previously: `by_client` guard held while locking
+    /// `allocations`) and the `cleanup_*` paths (`allocations` retain lock held
+    /// while removing from `by_client`). Same watchdog shape as the test below.
+    #[test]
+    fn client_lookup_and_cleanup_do_not_deadlock_under_contention() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+        use std::time::Duration;
+
+        let table = Arc::new(AllocationTable::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+
+        const WRITERS: usize = 8;
+        for t in 0..WRITERS {
+            let table = Arc::clone(&table);
+            let stop = Arc::clone(&stop);
+            let progress = Arc::clone(&progress);
+            handles.push(thread::spawn(move || {
+                let mut n: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    // Tiny port space so both maps collide on shards constantly.
+                    let port = 30000 + ((t as u64 * 131 + n) % 64) as u16;
+                    let client: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+                    let (id, _) = table.create_or_get(client, "u".to_string(), 600, [0u8; 12]);
+                    if let Some(a) = table.get_by_client(client) {
+                        assert_eq!(a.client_addr, client);
+                    }
+                    let _ = table.is_client(client);
+                    let _ = table.get(id);
+                    n += 1;
+                }
+                progress.fetch_add(n, Ordering::Relaxed);
+            }));
+        }
+
+        const CLEANERS: usize = 2;
+        for _ in 0..CLEANERS {
+            let table = Arc::clone(&table);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    table.cleanup_inactive(0);
+                }
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(1500));
+        stop.store(true, Ordering::Relaxed);
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for h in handles {
+                let _ = h.join();
+            }
+            let _ = tx.send(());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(()) => assert!(
+                progress.load(Ordering::Relaxed) > 0,
+                "writers made no progress"
+            ),
+            Err(_) => panic!(
+                "deadlock: get_by_client/create_or_get and cleanup_* threads did not \
+                 finish after stop -- a by_client guard is being held while locking \
+                 allocations (see AllocationTable lock-order doc)"
+            ),
+        }
+    }
+
+    #[test]
+    fn bind_channel_removes_stale_reverse_and_forward_entries() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+        let a: SocketAddr = "203.0.113.1:5000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:5000".parse().unwrap();
+        let alloc = table.get(id).unwrap();
+
+        // Rebind the channel to another peer: the old peer must no longer map
+        // to the channel.
+        alloc.bind_channel(0x4000, a);
+        alloc.bind_channel(0x4000, b);
+        assert_eq!(alloc.peer_for_channel(0x4000), Some(b));
+        assert_eq!(alloc.channel_for_peer(a), None);
+        assert_eq!(alloc.channel_for_peer(b), Some(0x4000));
+        assert_eq!(alloc.channels_count(), 1);
+
+        // Rebind the peer to another channel: the old channel must be freed.
+        alloc.bind_channel(0x4001, b);
+        assert_eq!(alloc.peer_for_channel(0x4000), None);
+        assert_eq!(alloc.peer_for_channel(0x4001), Some(b));
+        assert_eq!(alloc.channel_for_peer(b), Some(0x4001));
+        assert_eq!(alloc.channels_count(), 1);
+
+        // Refreshing an identical binding is a no-op.
+        alloc.bind_channel(0x4001, b);
+        assert_eq!(alloc.channels_count(), 1);
+    }
+
+    #[test]
+    fn remove_reports_whether_it_removed() {
+        let table = AllocationTable::new();
+        let client = "192.168.1.100:54321".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+        assert!(table.remove(id));
+        assert!(!table.remove(id));
+        assert!(table.get_by_client(client).is_none());
+    }
+
+    /// Regression guard for the ABBA deadlock between `register_ice_ufrags`
+    /// (locks `by_ice_ufrag` then `allocations`) and the `cleanup_*` paths
+    /// (lock `allocations` via `retain`, then `by_ice_ufrag`). The lock-order
+    /// invariant requires `allocations` to be acquired first everywhere. If a
+    /// future change reintroduces the inverse order, the writer and cleanup
+    /// threads deadlock and never observe `stop`, so the watchdog fails the test
+    /// instead of hanging the whole suite.
+    #[test]
+    fn register_and_cleanup_do_not_deadlock_under_contention() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+        use std::time::Duration;
+
+        let table = Arc::new(AllocationTable::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+
+        // Writers: create an allocation and register a fresh ICE ufrag. The
+        // fresh ufrag forces the `Vacant` arm of `register_ice_ufrags`, which is
+        // where it holds a `by_ice_ufrag` write lock while touching `allocations`.
+        const WRITERS: usize = 8;
+        for t in 0..WRITERS {
+            let table = Arc::clone(&table);
+            let stop = Arc::clone(&stop);
+            let progress = Arc::clone(&progress);
+            handles.push(thread::spawn(move || {
+                let mut n: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    // Small, recycled client-port space so shards collide often.
+                    let port = 20000 + ((t as u64 * 251 + n) % 512) as u16;
+                    let client: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+                    let id = table.create(client, "strom".to_string(), 600);
+                    table.register_ice_ufrags(id, format!("L{}-{}", t, n), format!("R{}-{}", t, n));
+                    n += 1;
+                }
+                progress.fetch_add(n, Ordering::Relaxed);
+            }));
+        }
+
+        // Cleaners: `cleanup_inactive(0)` removes every allocation unconditionally
+        // (now - last_received >= 0 always holds), exercising the removal branch
+        // that locks `by_ice_ufrag` while holding the `allocations` retain lock.
+        const CLEANERS: usize = 2;
+        for _ in 0..CLEANERS {
+            let table = Arc::clone(&table);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    table.cleanup_inactive(0);
+                }
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(1500));
+        stop.store(true, Ordering::Relaxed);
+
+        // Watchdog: a separate thread joins the workers. If they deadlocked they
+        // never exit, the join blocks, and `recv_timeout` fails the test loudly.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for h in handles {
+                let _ = h.join();
+            }
+            let _ = tx.send(());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(()) => assert!(
+                progress.load(Ordering::Relaxed) > 0,
+                "writers made no progress"
+            ),
+            Err(_) => panic!(
+                "deadlock: register_ice_ufrags and cleanup_* threads did not finish \
+                 after stop -- lock-order inversion reintroduced (allocations must be \
+                 locked before any secondary index; see AllocationTable lock-order doc)"
+            ),
+        }
+    }
+
+    #[test]
+    fn same_allocation_can_update_ice_ufrags_on_restart() {
+        let table = AllocationTable::new();
+        let client = "198.51.100.5:50000".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        assert!(table.register_ice_ufrags(id, "OLDLOC".into(), "OLDREM".into()));
+        assert_eq!(table.lookup_by_ice_ufrag("OLDLOC"), Some(id));
+
+        // ICE restart: new local + remote on the same allocation.
+        assert!(table.register_ice_ufrags(id, "NEWLOC".into(), "NEWREM".into()));
+        assert_eq!(table.lookup_by_ice_ufrag("NEWLOC"), Some(id));
+        assert!(
+            table.lookup_by_ice_ufrag("OLDLOC").is_none(),
+            "old local ufrag must be released"
+        );
+        let alloc = table.get(id).unwrap();
+        assert_eq!(alloc.get_ice_ufrag().as_deref(), Some("NEWLOC"));
+        assert_eq!(alloc.get_ice_remote_ufrag().as_deref(), Some("NEWREM"));
+    }
+
+    #[test]
+    fn same_allocation_can_refresh_remote_ufrag_with_same_local() {
+        let table = AllocationTable::new();
+        let client = "198.51.100.5:50001".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+
+        assert!(table.register_ice_ufrags(id, "LOC".into(), "REM1".into()));
+        assert!(table.register_ice_ufrags(id, "LOC".into(), "REM2".into()));
+        assert_eq!(
+            table.get(id).unwrap().get_ice_remote_ufrag().as_deref(),
+            Some("REM2")
+        );
+        assert_eq!(table.lookup_by_ice_ufrag("LOC"), Some(id));
+    }
+
+    #[test]
+    fn different_allocation_cannot_hijack_ice_ufrag() {
+        let table = AllocationTable::new();
+        let a = table.create("198.51.100.5:50002".parse().unwrap(), "a".into(), 600);
+        let b = table.create("198.51.100.5:50003".parse().unwrap(), "b".into(), 600);
+
+        assert!(table.register_ice_ufrags(a, "SHARED".into(), "PEER".into()));
+        assert!(
+            !table.register_ice_ufrags(b, "SHARED".into(), "OTHER".into()),
+            "second allocation must not steal the ufrag"
+        );
+        assert_eq!(table.lookup_by_ice_ufrag("SHARED"), Some(a));
+        assert_eq!(
+            table.get(a).unwrap().get_ice_remote_ufrag().as_deref(),
+            Some("PEER")
+        );
+        assert!(table.get(b).unwrap().get_ice_ufrag().is_none());
+    }
+
+    #[test]
+    fn permission_expires_after_lifetime_and_create_permission_refreshes() {
+        crate::coarse_time::init();
+        let table = AllocationTable::new();
+        let client = "198.51.100.5:50004".parse().unwrap();
+        let id = table.create(client, "u".to_string(), 600);
+        let peer = ip("203.0.113.50");
+
+        assert!(table.try_add_permissions_capped(id, &[peer], 8));
+        assert!(table.get(id).unwrap().is_permitted(peer));
+
+        // Force expiry.
+        {
+            let alloc = table.get(id).unwrap();
+            alloc.permissions.write().insert(peer, 0);
+            assert!(!alloc.is_permitted(peer));
+        }
+
+        // CreatePermission-equivalent refresh via capped path.
+        assert!(table.try_add_permissions_capped(id, &[peer], 8));
+        assert!(table.get(id).unwrap().is_permitted(peer));
+    }
+
+    #[test]
+    fn by_permission_drops_empty_vec_on_remove() {
+        let table = AllocationTable::new();
+        let id = table.create("198.51.100.5:50005".parse().unwrap(), "u".into(), 600);
+        let peer = ip("203.0.113.60");
+        table.add_permission(id, peer);
+        assert!(table.by_permission.contains_key(&peer));
+        table.remove(id);
+        assert!(
+            !table.by_permission.contains_key(&peer),
+            "empty Vec must not linger in by_permission"
+        );
+    }
+
+    #[test]
+    fn cleanup_permissions_reaps_expired_and_index() {
+        crate::coarse_time::init();
+        let table = AllocationTable::new();
+        let id = table.create("198.51.100.5:50006".parse().unwrap(), "u".into(), 600);
+        let peer = ip("203.0.113.70");
+        table.add_permission(id, peer);
+        table.get(id).unwrap().permissions.write().insert(peer, 0);
+        table.cleanup_permissions();
+        assert!(!table.get(id).unwrap().is_permitted(peer));
+        assert!(!table.by_permission.contains_key(&peer));
     }
 }

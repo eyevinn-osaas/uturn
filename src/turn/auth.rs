@@ -1,6 +1,7 @@
 //! TURN authentication (long-term credentials)
 
-use hmac::{Hmac, Mac};
+use base64::Engine;
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
@@ -16,6 +17,33 @@ impl TurnAuth {
         let input = format!("{}:{}:{}", username, realm, password);
         let digest = md5::compute(input.as_bytes());
         digest.0
+    }
+
+    /// Expiry (unix seconds) carried by a TURN REST API username.
+    ///
+    /// The format is `<expiry>:<id>` or a bare `<expiry>`
+    /// (draft-uberti-behave-turn-rest). Like coturn's `use-auth-secret`, the
+    /// reversed `<id>:<expiry>` is accepted too: when the part before the
+    /// first `:` is not a timestamp, the rest of the username must be.
+    /// Returns `None` when no timestamp is found.
+    pub fn ephemeral_expiry(username: &str) -> Option<u64> {
+        fn timestamp(s: &str) -> Option<u64> {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse().ok()
+        }
+        match username.split_once(':') {
+            Some((head, tail)) => timestamp(head).or_else(|| timestamp(tail)),
+            None => timestamp(username),
+        }
+    }
+
+    /// Password for a TURN REST API username: base64(HMAC-SHA1(secret, username))
+    pub fn ephemeral_password(secret: &str, username: &str) -> String {
+        let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC key length");
+        mac.update(username.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
     }
 
     /// Compute MESSAGE-INTEGRITY attribute value
@@ -86,25 +114,27 @@ impl TurnAuth {
             Err(_) => return false,
         };
 
-        // Verify HMAC using constant-time comparison to prevent timing attacks
+        // Verify HMAC and freshness without early-returning on either check.
+        // Both branches are always evaluated and combined bitwise so timing
+        // does not reveal which check (or both) failed.
         let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC key length");
         mac.update(&timestamp.to_be_bytes());
         let hmac_result = mac.finalize().into_bytes();
         let expected_hmac = u64::from_be_bytes(hmac_result[..8].try_into().unwrap());
 
-        // Constant-time comparison
-        let mut diff = 0u64;
-        diff |= provided_hmac ^ expected_hmac;
-        if diff != 0 {
-            return false;
-        }
+        let hmac_ok = (provided_hmac ^ expected_hmac) == 0;
 
-        // Check timestamp freshness
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        now.saturating_sub(timestamp) < max_age_secs
+        // A timestamp in the future (clock stepped backwards, or a forged
+        // value) must not count as fresh: saturating_sub would otherwise yield
+        // 0 and accept it indefinitely.
+        let not_future = timestamp <= now;
+        let fresh = now.saturating_sub(timestamp) < max_age_secs;
+
+        hmac_ok & not_future & fresh
     }
 }
 
@@ -116,8 +146,46 @@ mod tests {
     fn test_compute_key() {
         // Test vector from RFC 5389
         let key = TurnAuth::compute_key("user", "realm", "pass");
-        // Key is MD5("user:realm:pass")
-        assert_eq!(key.len(), 16);
+        // Key is MD5("user:realm:pass"). Independent reference:
+        // printf 'user:realm:pass' | openssl dgst -md5
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "8493fbc53ba582fb4c044c456bdc40eb");
+    }
+
+    #[test]
+    fn test_ephemeral_password_vector() {
+        // Independent reference:
+        // printf '1761100000:alice' | openssl dgst -sha1 -hmac example-secret -binary | base64
+        assert_eq!(
+            TurnAuth::ephemeral_password("example-secret", "1761100000:alice"),
+            "IhDlw9EWGUfbCxOx+FBk4ye0Kd0="
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_expiry() {
+        assert_eq!(
+            TurnAuth::ephemeral_expiry("1761100000:alice"),
+            Some(1761100000)
+        );
+        assert_eq!(TurnAuth::ephemeral_expiry("1761100000"), Some(1761100000));
+        assert_eq!(
+            TurnAuth::ephemeral_expiry("1761100000:a:b"),
+            Some(1761100000)
+        );
+        // coturn also accepts the reversed order and a leading separator.
+        assert_eq!(
+            TurnAuth::ephemeral_expiry("alice:1761100000"),
+            Some(1761100000)
+        );
+        assert_eq!(TurnAuth::ephemeral_expiry(":1761100000"), Some(1761100000));
+        assert_eq!(TurnAuth::ephemeral_expiry("alice"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("alice:bob"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("alice:1761100000:x"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry(":alice"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry(""), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("+12:alice"), None);
+        assert_eq!(TurnAuth::ephemeral_expiry("99999999999999999999:x"), None);
     }
 
     #[test]
@@ -156,5 +224,18 @@ mod tests {
 
         // Invalid format should fail
         assert!(!TurnAuth::validate_nonce("invalid", 3600, &secret));
+
+        // A nonce stamped in the future must be rejected even with a valid HMAC
+        // (simulates the system clock having been stepped backwards).
+        let future_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 10_000;
+        let mut mac = HmacSha1::new_from_slice(&secret).unwrap();
+        mac.update(&future_ts.to_be_bytes());
+        let h = u64::from_be_bytes(mac.finalize().into_bytes()[..8].try_into().unwrap());
+        let future_nonce = format!("{:016x}:{:016x}", future_ts, h);
+        assert!(!TurnAuth::validate_nonce(&future_nonce, 3600, &secret));
     }
 }

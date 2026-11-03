@@ -1,16 +1,29 @@
-//! uTURN - Single-port TURN relay server
+//! uTURN - Single-port TURN relay for WebRTC
+//!
+//! Client-to-client traffic through the shared relay address is routed by ICE
+//! ufrag, so both sides must be ICE agents. See ARCHITECTURE.md for scope.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use tokio::signal;
-use tracing::{info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use uturn::{Config, Server};
 
 #[derive(Parser, Debug)]
 #[command(name = "uturn")]
-#[command(about = "A single-port TURN relay server for WebRTC")]
+#[command(about = "Single-port TURN relay for WebRTC")]
+#[command(
+    long_about = "Single-port TURN relay for WebRTC. Internal (client-to-client) \
+and external (client-to-peer) traffic are routed over this one UDP port, so \
+there is a single port to expose rather than a relay port range.\n\n\
+Client-to-client relaying through the shared single-port relay address is \
+routed by ICE ufrag, so both sides must be ICE agents. Plain client-to-\
+external-peer relaying follows RFC 5766 and works with any TURN client. \
+This is not a drop-in general-purpose TURN server: no TCP, no TURNS, and \
+all clients share one relay address."
+)]
 #[command(version)]
 struct Args {
     /// UDP port to listen on
@@ -26,8 +39,22 @@ struct Args {
     realm: String,
 
     /// Static credentials in format user:password (can be repeated)
-    #[arg(short, long, env = "UTURN_USERS", value_delimiter = ',')]
+    #[arg(
+        short,
+        long,
+        env = "UTURN_USERS",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
     user: Vec<String>,
+
+    /// Shared secret for time-limited TURN REST API credentials (coturn's
+    /// `static-auth-secret`). Username `<expiry-unix-secs>:<id>`, password
+    /// base64(HMAC-SHA1(secret, username)). Repeat the flag, or separate with
+    /// whitespace in the env var, to accept several secrets while rotating.
+    /// Each secret must be at least 16 bytes.
+    #[arg(long, env = "UTURN_AUTH_SECRET", hide_env_values = true)]
+    static_auth_secret: Vec<String>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "UTURN_LOG_LEVEL", default_value = "info")]
@@ -44,6 +71,21 @@ struct Args {
     /// Nonce validity period in seconds
     #[arg(long, env = "UTURN_NONCE_LIFETIME", default_value = "3600")]
     nonce_lifetime_secs: u64,
+
+    /// Run as an open relay with no authentication. Without this flag the
+    /// server refuses to start when neither `--user` nor
+    /// `--static-auth-secret` is configured. Exposing an
+    /// anonymous relay on the public internet will be abused.
+    #[arg(long, env = "UTURN_ALLOW_ANONYMOUS", default_value = "false")]
+    allow_anonymous: bool,
+
+    /// Maximum number of peer IP permissions per allocation
+    #[arg(long, env = "UTURN_MAX_PERMISSIONS", default_value = "64")]
+    max_permissions_per_alloc: usize,
+
+    /// Maximum number of bound channels per allocation
+    #[arg(long, env = "UTURN_MAX_CHANNELS", default_value = "128")]
+    max_channels_per_alloc: usize,
 }
 
 #[tokio::main]
@@ -71,19 +113,34 @@ async fn main() -> Result<()> {
         })
         .collect();
 
+    let auth_secrets = parse_auth_secrets(&args.static_auth_secret)?;
+
+    if credentials.is_empty() && auth_secrets.is_empty() && !args.allow_anonymous {
+        error!("No credentials configured. Refusing to start an unauthenticated TURN relay.");
+        error!(
+            "Pass --user USER:PASS (or UTURN_USERS=...) and/or \
+             --static-auth-secret SECRET (or UTURN_AUTH_SECRET=...) to configure auth, \
+             or --allow-anonymous to intentionally run as an open relay."
+        );
+        bail!("missing credentials");
+    }
+
     // Generate random nonce secret at startup
-    use rand::Rng;
-    let nonce_secret: [u8; 16] = rand::thread_rng().gen();
+    let nonce_secret: [u8; 16] = rand::random();
 
     let config = Config {
         port: args.port,
         external_ip: args.external_ip,
         realm: args.realm,
         credentials,
+        auth_secrets,
         max_allocations_per_ip: args.max_allocations_per_ip,
         rate_limit_per_minute: args.rate_limit_per_minute,
         nonce_lifetime_secs: args.nonce_lifetime_secs,
         nonce_secret,
+        allow_anonymous: args.allow_anonymous,
+        max_permissions_per_alloc: args.max_permissions_per_alloc,
+        max_channels_per_alloc: args.max_channels_per_alloc,
     };
 
     info!(
@@ -92,6 +149,21 @@ async fn main() -> Result<()> {
         config.port,
         config.external_ip
     );
+
+    if !config.auth_secrets.is_empty() {
+        info!(
+            "TURN REST API credentials enabled ({} shared secret(s))",
+            config.auth_secrets.len()
+        );
+    }
+
+    if !config.auth_enabled() {
+        warn!(
+            "ANONYMOUS MODE: server is running as an open relay with no authentication. \
+             This will be abused on the public internet (amplification, free transit, \
+             SSRF pivots). Use only on trusted networks."
+        );
+    }
 
     let server = Server::new(config).await?;
 
@@ -105,6 +177,33 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Minimum length of a TURN REST API shared secret, in bytes.
+const MIN_AUTH_SECRET_LEN: usize = 16;
+
+/// Split `--static-auth-secret` values into secrets.
+///
+/// Whitespace separates secrets (so one env var can carry several during
+/// rotation, and a trailing newline from a mounted secret file is dropped).
+/// Commas are deliberately *not* separators: a generated secret may contain
+/// one, and splitting it would silently turn it into weaker keys. A short
+/// secret is refused for the same reason - it is brute-forceable offline from
+/// a single observed credential.
+fn parse_auth_secrets(values: &[String]) -> Result<Vec<String>> {
+    let secrets: Vec<String> = values
+        .iter()
+        .flat_map(|v| v.split_whitespace())
+        .map(str::to_string)
+        .collect();
+    if let Some(short) = secrets.iter().find(|s| s.len() < MIN_AUTH_SECRET_LEN) {
+        bail!(
+            "--static-auth-secret: a {}-byte secret is too short (minimum {} bytes)",
+            short.len(),
+            MIN_AUTH_SECRET_LEN
+        );
+    }
+    Ok(secrets)
 }
 
 async fn shutdown_signal() {
@@ -128,5 +227,69 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    const A: &str = "aaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn auth_secrets_split_on_whitespace_only() {
+        assert_eq!(parse_auth_secrets(&strings(&[A])).unwrap(), strings(&[A]));
+        assert_eq!(
+            parse_auth_secrets(&strings(&[&format!("{A} {B}\n")])).unwrap(),
+            strings(&[A, B])
+        );
+        assert_eq!(
+            parse_auth_secrets(&strings(&[A, B])).unwrap(),
+            strings(&[A, B])
+        );
+        // A comma is part of the secret, not a separator.
+        let with_comma = format!("{A},{B}");
+        assert_eq!(
+            parse_auth_secrets(&strings(&[&with_comma])).unwrap(),
+            strings(&[&with_comma])
+        );
+    }
+
+    #[test]
+    fn auth_secrets_empty_values_yield_none() {
+        assert!(parse_auth_secrets(&strings(&[])).unwrap().is_empty());
+        assert!(parse_auth_secrets(&strings(&["", " \n"]))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn short_auth_secret_is_refused() {
+        assert!(parse_auth_secrets(&strings(&["short"])).is_err());
+        // "new, old"-style input must fail loudly, not run with fragments.
+        assert!(parse_auth_secrets(&strings(&[&format!("{A}, x")])).is_err());
+    }
+
+    #[test]
+    fn secret_alone_satisfies_startup_gate() {
+        let args = Args::try_parse_from([
+            "uturn",
+            "--external-ip",
+            "203.0.113.10",
+            "--static-auth-secret",
+            A,
+        ])
+        .unwrap();
+        assert!(args.user.is_empty());
+        assert!(!args.allow_anonymous);
+        assert_eq!(
+            parse_auth_secrets(&args.static_auth_secret).unwrap(),
+            strings(&[A])
+        );
     }
 }
