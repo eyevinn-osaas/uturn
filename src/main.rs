@@ -3,7 +3,7 @@
 //! Client-to-client traffic through the shared relay address is routed by ICE
 //! ufrag, so both sides must be ICE agents. See ARCHITECTURE.md for scope.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tokio::signal;
 use tracing::{error, info, warn, Level};
@@ -30,9 +30,21 @@ struct Args {
     #[arg(short, long, env = "UTURN_PORT", default_value = "3478")]
     port: u16,
 
-    /// External/public IP address for relay addresses
+    /// External/public IP address for relay addresses. If omitted, it is
+    /// auto-detected at startup with a STUN Binding request to the
+    /// `--stun-server` list (IPv4 only; set it explicitly for IPv6).
     #[arg(short, long, env = "UTURN_EXTERNAL_IP")]
-    external_ip: std::net::IpAddr,
+    external_ip: Option<std::net::IpAddr>,
+
+    /// STUN servers (host:port) used to auto-detect the external IP when
+    /// `--external-ip` is not set. Queried in parallel; the first answer wins.
+    #[arg(
+        long,
+        env = "UTURN_STUN_SERVERS",
+        value_delimiter = ',',
+        default_values_t = uturn::discover::DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string())
+    )]
+    stun_server: Vec<String>,
 
     /// TURN realm
     #[arg(short, long, env = "UTURN_REALM", default_value = "uturn")]
@@ -86,6 +98,13 @@ struct Args {
     /// Maximum number of bound channels per allocation
     #[arg(long, env = "UTURN_MAX_CHANNELS", default_value = "128")]
     max_channels_per_alloc: usize,
+
+    /// Peer addresses (ip:port) on the relay's own external IP that clients
+    /// may still relay to, e.g. an SFU sharing the public IP on another port.
+    /// By default every port on the external IP except the relay port is
+    /// refused. Comma-separated; exact matches only.
+    #[arg(long, env = "UTURN_ALLOWED_PEERS", value_delimiter = ',', value_parser = parse_peer_addr)]
+    allowed_peer: Vec<std::net::SocketAddr>,
 }
 
 #[tokio::main]
@@ -125,12 +144,25 @@ async fn main() -> Result<()> {
         bail!("missing credentials");
     }
 
+    let external_ip = match args.external_ip {
+        Some(ip) => ip,
+        None => {
+            info!("No external IP configured, detecting via STUN");
+            uturn::discover::discover_public_ip(&args.stun_server, STUN_DISCOVERY_TIMEOUT)
+                .await
+                .context(
+                    "could not auto-detect the external IP; \
+                     set --external-ip (or UTURN_EXTERNAL_IP)",
+                )?
+        }
+    };
+
     // Generate random nonce secret at startup
     let nonce_secret: [u8; 16] = rand::random();
 
     let config = Config {
         port: args.port,
-        external_ip: args.external_ip,
+        external_ip,
         realm: args.realm,
         credentials,
         auth_secrets,
@@ -141,6 +173,7 @@ async fn main() -> Result<()> {
         allow_anonymous: args.allow_anonymous,
         max_permissions_per_alloc: args.max_permissions_per_alloc,
         max_channels_per_alloc: args.max_channels_per_alloc,
+        allowed_peers: args.allowed_peer,
     };
 
     info!(
@@ -155,6 +188,23 @@ async fn main() -> Result<()> {
             "TURN REST API credentials enabled ({} shared secret(s))",
             config.auth_secrets.len()
         );
+    }
+
+    if !config.allowed_peers.is_empty() {
+        info!(
+            "Allowed peers on the external IP: {:?}",
+            config.allowed_peers
+        );
+        for peer in &config.allowed_peers {
+            if peer.ip() != config.external_ip {
+                warn!(
+                    "Allowed peer {} has no effect: its IP is not the external IP {}. \
+                     Only targets on the external IP need listing; loopback and other \
+                     forbidden addresses cannot be allowed.",
+                    peer, config.external_ip
+                );
+            }
+        }
     }
 
     if !config.auth_enabled() {
@@ -179,8 +229,19 @@ async fn main() -> Result<()> {
     }
 }
 
+/// How long to wait for any STUN server to answer during IP auto-detection.
+const STUN_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Minimum length of a TURN REST API shared secret, in bytes.
 const MIN_AUTH_SECRET_LEN: usize = 16;
+
+/// Parse one `--allowed-peer` entry, ignoring surrounding whitespace so
+/// `UTURN_ALLOWED_PEERS="a:1, b:2"` works.
+fn parse_peer_addr(s: &str) -> std::result::Result<std::net::SocketAddr, String> {
+    s.trim()
+        .parse()
+        .map_err(|e| format!("invalid ip:port {:?}: {}", s.trim(), e))
+}
 
 /// Split `--static-auth-secret` values into secrets.
 ///
@@ -290,6 +351,36 @@ mod tests {
         assert_eq!(
             parse_auth_secrets(&args.static_auth_secret).unwrap(),
             strings(&[A])
+        );
+    }
+
+    #[test]
+    fn allowed_peers_parse_comma_separated_with_spaces() {
+        // Same delimiter and parser as UTURN_ALLOWED_PEERS.
+        let args = Args::try_parse_from([
+            "uturn",
+            "--user",
+            "u:p",
+            "--allowed-peer",
+            "203.0.113.10:30029, 203.0.113.10:30031",
+        ])
+        .unwrap();
+        let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert_eq!(
+            args.allowed_peer,
+            vec![sa("203.0.113.10:30029"), sa("203.0.113.10:30031")]
+        );
+        assert!(Args::try_parse_from(["uturn", "--allowed-peer", "bogus"]).is_err());
+        assert!(Args::try_parse_from(["uturn", "--allowed-peer", "203.0.113.10"]).is_err());
+    }
+
+    #[test]
+    fn external_ip_is_optional_with_default_stun_servers() {
+        let args = Args::try_parse_from(["uturn", "--user", "u:p"]).unwrap();
+        assert!(args.external_ip.is_none());
+        assert_eq!(
+            args.stun_server,
+            strings(uturn::discover::DEFAULT_STUN_SERVERS)
         );
     }
 }
